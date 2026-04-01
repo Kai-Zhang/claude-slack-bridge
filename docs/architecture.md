@@ -286,8 +286,50 @@ Between tool calls, pre_tool_use.sh calls GET localhost:9876/inbox
 | `BRIDGE_PORT` | No (default `9876`) | Local port for hook ↔ bridge communication |
 | `APPROVAL_TIMEOUT` | No (default `1800`) | Seconds to wait for an approval response |
 | `APPROVAL_DEFAULT` | No (default `deny`) | Decision on timeout: `deny` or `approve` |
-| `THREAD_FILE` | No | Path to persist the current thread timestamp |
-| `INBOX_FILE` | No | Path to the inject/stop message queue file |
+| `THREAD_FILE` | No (default `/tmp/claude_threads.json`) | JSON file persisting `session_id → thread_ts` mappings |
+
+---
+
+## Session model
+
+### Session identity
+
+Claude Code assigns a `session_id` to every session. This ID is stable across `claude --resume` — resuming a session reuses the same ID. The bridge uses `session_id` as the key for all per-session state.
+
+Hook scripts extract `session_id` from the JSON payload on stdin and pass it with every request to the local bridge HTTP API.
+
+### Thread mapping
+
+The bridge maintains a persistent JSON file mapping each known session to its Slack thread:
+
+```json
+{
+  "abc123": "1712345678.000100",
+  "def456": "1712345699.000200"
+}
+```
+
+On first activity for a session, the bridge creates a new thread and records the mapping. On `claude --resume`, the same `session_id` resolves to the same `thread_ts` — messages continue in the existing thread. A new session (new `session_id`) always creates a new thread.
+
+### Per-session state
+
+Each active session in the bridge holds independent state:
+
+| State | Description |
+|---|---|
+| `thread_ts` | Slack thread timestamp; identifies the session's thread |
+| `approval_event` | Threading event signalled when an approve/deny arrives |
+| `approval_result` | `'approved'` or `'denied'`, set before signalling |
+| `inbox` | In-memory queue of inject/stop messages |
+
+### Event routing within the bridge
+
+The Router continues to route events by `channel_id`. The bridge maintains a reverse mapping `{thread_ts → session_id}` and dispatches each incoming event to the correct session based on the `thread_ts` field in the event payload.
+
+- `block_actions` (button click): Router extracts `container.thread_ts` → bridge matches session
+- `app_mention` in thread: Router extracts `event.thread_ts` → bridge matches session
+- `message.im` in thread: Router extracts `event.thread_ts` → bridge matches session
+- Events with no `thread_ts`: rejected at the router level; inject/stop are not executed
 
 ---
 

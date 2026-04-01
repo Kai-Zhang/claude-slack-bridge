@@ -24,13 +24,15 @@ fi
 
 # Parse hook input (JSON on stdin)
 HOOK_INPUT=$(cat)
-TOOL_NAME=$(echo "$HOOK_INPUT" | jq -r '.tool_name // ""')
+SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
+TOOL_NAME=$(echo "$HOOK_INPUT"  | jq -r '.tool_name  // ""')
 TOOL_INPUT_JSON=$(echo "$HOOK_INPUT" | jq -c '.tool_input // {}')
 
 # ---------------------------------------------------------------------------
 # 1. Check inbox for inject / stop messages
 # ---------------------------------------------------------------------------
-INBOX_RESPONSE=$(curl -sf --max-time 5 "$BRIDGE_URL/inbox" 2>/dev/null \
+INBOX_RESPONSE=$(curl -sf --max-time 5 \
+    "${BRIDGE_URL}/inbox?session_id=${SESSION_ID}" 2>/dev/null \
     || echo '{"messages":[]}')
 MESSAGES=$(echo "$INBOX_RESPONSE" | jq -r '.messages[]' 2>/dev/null || true)
 
@@ -75,8 +77,11 @@ if requires_approval; then
         --max-time "$((TIMEOUT + 30))" \
         -X POST "$BRIDGE_URL/approval" \
         -H "Content-Type: application/json" \
-        -d "{\"tool\": $(printf '%s' "$TOOL_NAME" | jq -Rs .), \
-             \"command\": $(printf '%s' "$COMMAND" | jq -Rs .)}" \
+        -d "{\"session_id\": $(printf '%s' "$SESSION_ID"  | jq -Rs .),
+             \"tool\":       $(printf '%s' "$TOOL_NAME"   | jq -Rs .),
+             \"command\":    $(printf '%s' "$COMMAND"     | jq -Rs .),
+             \"cwd\":        $(printf '%s' "$PWD"         | jq -Rs .),
+             \"task_title\": $(printf '%s' "${CLAUDE_TASK:-}" | jq -Rs .)}" \
         2>/dev/null) || {
         echo "⚠️ Could not reach bridge during approval request. Operation denied."
         exit 2

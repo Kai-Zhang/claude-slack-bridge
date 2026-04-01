@@ -2,20 +2,23 @@
 """
 Claude Code Slack Bridge — Local Bridge
 
-Connects to the central router and exposes a local HTTP API for Claude Code
-hook scripts. Requires no direct Slack credentials.
+Each Claude Code session (identified by session_id from hook payloads) has its
+own Slack thread, approval gate, and inbox queue. Multiple sessions can run
+concurrently on the same bridge instance.
 
-Endpoints  (localhost:{BRIDGE_PORT}  — for hook scripts only)
--------------------------------------------------------------
-GET  /health          liveness check
-GET  /inbox           return and clear queued inject/stop messages
-POST /send            post a message to the current task thread
-POST /approval        request approval (blocks until response or timeout)
-POST /thread/reset    clear the current thread state
+Endpoints  (localhost:{BRIDGE_PORT}  — called by hook scripts only)
+-------------------------------------------------------------------
+GET  /health                  liveness check
+GET  /inbox?session_id=…      return and clear queued inject/stop messages
+POST /send                    post to the session thread
+POST /approval                request approval; blocks until response or timeout
+POST /thread/reset            force-start a new thread for a session
 """
 
 import atexit
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -24,7 +27,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 # ---------------------------------------------------------------------------
@@ -55,8 +58,7 @@ SLACK_CHANNEL_ID = cfg.get('SLACK_CHANNEL_ID', '')
 BRIDGE_PORT      = int(cfg.get('BRIDGE_PORT', 9876))
 APPROVAL_TIMEOUT = int(cfg.get('APPROVAL_TIMEOUT', 1800))
 APPROVAL_DEFAULT = cfg.get('APPROVAL_DEFAULT', 'deny')
-THREAD_FILE      = Path(cfg.get('THREAD_FILE', '/tmp/claude_thread_ts'))
-INBOX_FILE       = Path(cfg.get('INBOX_FILE', '/tmp/claude_inbox'))
+THREAD_FILE      = Path(cfg.get('THREAD_FILE', '/tmp/claude_threads.json'))
 
 for _var, _val in [('ROUTER_URL',       ROUTER_URL),
                    ('ROUTER_SECRET',    ROUTER_SECRET),
@@ -66,14 +68,60 @@ for _var, _val in [('ROUTER_URL',       ROUTER_URL),
 
 
 # ---------------------------------------------------------------------------
-# Shared state
+# Per-session state
 # ---------------------------------------------------------------------------
 
-_lock             = threading.Lock()
-_thread_ts:       Optional[str] = None
-_approval_event   = threading.Event()
-_approval_result: Optional[str] = None   # 'approved' | 'denied'
-_waiting_for_approval = False
+class _Session:
+    def __init__(self, session_id: str, thread_ts: Optional[str] = None):
+        self.session_id            = session_id
+        self.thread_ts             = thread_ts
+        self.task_title: Optional[str] = None   # from CLAUDE_TASK env var
+        self.cwd:        Optional[str] = None   # working dir of the Claude process
+        self.approval_event        = threading.Event()
+        self.approval_result: Optional[str] = None   # 'approved' | 'denied'
+        self.waiting_for_approval  = False
+        self.inbox:      List[str] = []
+        self.inbox_lock            = threading.Lock()
+        self._create_lock          = threading.Lock()  # serialises thread creation
+
+
+_global_lock:   threading.Lock       = threading.Lock()
+_sessions:      Dict[str, _Session]  = {}   # session_id → _Session
+_ts_to_session: Dict[str, str]       = {}   # thread_ts  → session_id
+_saved_threads: Dict[str, str]       = {}   # persisted session_id → thread_ts
+
+
+def _load_saved_threads() -> None:
+    global _saved_threads
+    if THREAD_FILE.exists():
+        try:
+            _saved_threads = json.loads(THREAD_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            _saved_threads = {}
+
+
+def _save_threads() -> None:
+    data: Dict[str, str] = {}
+    with _global_lock:
+        for sid, sess in _sessions.items():
+            if sess.thread_ts:
+                data[sid] = sess.thread_ts
+    try:
+        THREAD_FILE.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
+def _get_or_create_session(session_id: str) -> _Session:
+    with _global_lock:
+        if session_id in _sessions:
+            return _sessions[session_id]
+        ts = _saved_threads.get(session_id)
+        sess = _Session(session_id=session_id, thread_ts=ts)
+        if ts:
+            _ts_to_session[ts] = session_id
+        _sessions[session_id] = sess
+        return sess
 
 
 # ---------------------------------------------------------------------------
@@ -125,63 +173,86 @@ def _router_post(text: str, thread_ts: Optional[str] = None,
 # Thread management
 # ---------------------------------------------------------------------------
 
-def _get_or_create_thread() -> str:
-    global _thread_ts
-    with _lock:
-        if _thread_ts:
-            return _thread_ts
-    if THREAD_FILE.exists():
-        ts = THREAD_FILE.read_text().strip()
-        if ts:
-            with _lock:
-                _thread_ts = ts
-            return ts
-    ts = _router_post("🚀 *Claude task started*")
-    if not ts:
-        raise RuntimeError("Failed to create Slack thread: router returned no timestamp")
-    THREAD_FILE.write_text(ts)
-    with _lock:
-        _thread_ts = ts
-    return ts
+def _build_thread_title(session: _Session) -> str:
+    cwd = session.cwd or os.getcwd()
+    try:
+        repo_root = subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            stderr=subprocess.DEVNULL, cwd=cwd,
+        ).decode().strip()
+        repo_name = Path(repo_root).name
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            stderr=subprocess.DEVNULL, cwd=cwd,
+        ).decode().strip()
+        context = f"{repo_name} [{branch}]"
+    except Exception:
+        context = Path(cwd).name
+
+    if session.task_title:
+        return f"🚀 *{context}* — {session.task_title}"
+    return f"🚀 *{context}* — task started"
 
 
-def _post_to_thread(text: str, blocks: Optional[list] = None) -> None:
-    thread_ts = _get_or_create_thread()
+def _get_or_create_thread(session: _Session) -> str:
+    if session.thread_ts:
+        return session.thread_ts
+
+    with session._create_lock:
+        if session.thread_ts:   # re-check after acquiring lock
+            return session.thread_ts
+
+        ts = _router_post(_build_thread_title(session))
+        if not ts:
+            raise RuntimeError("Failed to create Slack thread: router returned no timestamp")
+
+        session.thread_ts = ts
+        with _global_lock:
+            _ts_to_session[ts] = session.session_id
+            _saved_threads[session.session_id] = ts
+        _save_threads()
+        return ts
+
+
+def _post_to_thread(session: _Session, text: str,
+                    blocks: Optional[list] = None) -> None:
+    thread_ts = _get_or_create_thread(session)
     _router_post(text, thread_ts=thread_ts, blocks=blocks)
 
 
 # ---------------------------------------------------------------------------
-# Inbox helpers
-# ---------------------------------------------------------------------------
-
-def _append_inbox(message: str) -> None:
-    with _lock:
-        with open(INBOX_FILE, 'a') as f:
-            f.write(message + '\n')
-
-
-# ---------------------------------------------------------------------------
-# Event polling (background thread)
+# Event polling  (background thread)
 # ---------------------------------------------------------------------------
 
 def _handle_event(event: dict) -> None:
-    global _approval_result
+    thread_ts = event.get('thread_ts')
+    if not thread_ts:
+        return
+
+    with _global_lock:
+        session_id = _ts_to_session.get(thread_ts)
+        session    = _sessions.get(session_id) if session_id else None
+
+    if not session:
+        return
+
     etype = event.get('type')
 
     if etype == 'action':
         action_id = event.get('action_id', '')
         if action_id in ('claude_approve', 'claude_deny'):
-            with _lock:
-                _approval_result = 'approved' if action_id == 'claude_approve' else 'denied'
-            _approval_event.set()
+            session.approval_result = 'approved' if action_id == 'claude_approve' else 'denied'
+            session.approval_event.set()
 
     elif etype == 'inject':
         text = event.get('text', '').strip()
         if text:
-            _append_inbox(text)
+            with session.inbox_lock:
+                session.inbox.append(text)
 
     elif etype == 'stop':
-        _append_inbox('STOP')
+        with session.inbox_lock:
+            session.inbox.append('STOP')
 
 
 def _poll_loop() -> None:
@@ -192,16 +263,18 @@ def _poll_loop() -> None:
                 _handle_event(event)
         except Exception:
             pass
-        time.sleep(1.0 if _waiting_for_approval else 3.0)
+        with _global_lock:
+            any_waiting = any(s.waiting_for_approval for s in _sessions.values())
+        time.sleep(1.0 if any_waiting else 3.0)
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler  (local API for Claude Code hooks — interface unchanged)
+# HTTP handler  (local API for Claude Code hooks — called from hook scripts)
 # ---------------------------------------------------------------------------
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass  # suppress access logs
+        pass
 
     def _read_json(self) -> dict:
         n = int(self.headers.get('Content-Length', 0))
@@ -215,37 +288,66 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _session_from_id(self, session_id: str) -> Optional['_Session']:
+        if not session_id:
+            self._send_json(400, {'error': 'session_id required'})
+            return None
+        return _get_or_create_session(session_id)
+
+    def _apply_context(self, session: '_Session', data: dict) -> None:
+        """Store cwd and task_title on first encounter."""
+        if data.get('cwd') and not session.cwd:
+            session.cwd = data['cwd']
+        if data.get('task_title') and not session.task_title:
+            session.task_title = data['task_title']
+
+    # --- GET ---
+
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
 
-        if path == '/health':
-            self._send_json(200, {'status': 'ok'})
+        if parsed.path == '/health':
+            with _global_lock:
+                n = len(_sessions)
+            self._send_json(200, {'status': 'ok', 'sessions': n})
 
-        elif path == '/inbox':
-            messages: List[str] = []
-            with _lock:
-                if INBOX_FILE.exists() and INBOX_FILE.stat().st_size > 0:
-                    content = INBOX_FILE.read_text()
-                    INBOX_FILE.write_text('')
-                    messages = [m for m in content.splitlines() if m.strip()]
+        elif parsed.path == '/inbox':
+            session_id = (params.get('session_id') or [None])[0] or ''
+            session = self._session_from_id(session_id)
+            if not session:
+                return
+            with session.inbox_lock:
+                messages = list(session.inbox)
+                session.inbox.clear()
             self._send_json(200, {'messages': messages})
 
         else:
             self._send_json(404, {'error': 'not found'})
 
+    # --- POST ---
+
     def do_POST(self):
-        global _thread_ts, _approval_result, _waiting_for_approval
         path = urlparse(self.path).path
         data = self._read_json()
 
         if path == '/send':
+            session = self._session_from_id(data.get('session_id', ''))
+            if not session:
+                return
+            self._apply_context(session, data)
             try:
-                _post_to_thread(data.get('text', ''), data.get('blocks'))
+                _post_to_thread(session, data.get('text', ''), data.get('blocks'))
                 self._send_json(200, {'ok': True})
             except Exception as e:
                 self._send_json(500, {'error': str(e)})
 
         elif path == '/approval':
+            session = self._session_from_id(data.get('session_id', ''))
+            if not session:
+                return
+            self._apply_context(session, data)
+
             tool    = data.get('tool', 'Bash')
             command = data.get('command', '')
             display = command[:300].replace('`', "'")
@@ -280,33 +382,30 @@ class _Handler(BaseHTTPRequestHandler):
             ]
 
             try:
-                _post_to_thread("Approval required", blocks)
+                _post_to_thread(session, "Approval required", blocks)
             except Exception as e:
                 self._send_json(500, {'error': f'failed to post approval card: {e}'})
                 return
 
-            with _lock:
-                _approval_event.clear()
-                _approval_result = None
-                _waiting_for_approval = True
+            session.approval_event.clear()
+            session.approval_result    = None
+            session.waiting_for_approval = True
 
             deadline = time.monotonic() + APPROVAL_TIMEOUT
             while time.monotonic() < deadline:
                 remaining = deadline - time.monotonic()
-                if _approval_event.wait(timeout=min(2.0, remaining)):
+                if session.approval_event.wait(timeout=min(2.0, remaining)):
                     break
-                # Allow /stop to interrupt an in-progress approval wait
-                with _lock:
-                    if INBOX_FILE.exists() and INBOX_FILE.stat().st_size > 0:
-                        if 'STOP' in INBOX_FILE.read_text().splitlines():
-                            _waiting_for_approval = False
-                            self._send_json(200, {'decision': 'denied', 'reason': 'stop_requested'})
-                            return
+                # Allow stop to interrupt a pending approval wait
+                with session.inbox_lock:
+                    if 'STOP' in session.inbox:
+                        session.waiting_for_approval = False
+                        self._send_json(200, {'decision': 'denied', 'reason': 'stop_requested'})
+                        return
 
-            with _lock:
-                _waiting_for_approval = False
-                decision   = _approval_result or APPROVAL_DEFAULT
-                timed_out  = _approval_result is None
+            session.waiting_for_approval = False
+            decision  = session.approval_result or APPROVAL_DEFAULT
+            timed_out = session.approval_result is None
 
             result: dict = {'decision': decision}
             if timed_out:
@@ -314,10 +413,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, result)
 
         elif path == '/thread/reset':
-            with _lock:
-                _thread_ts = None
-            if THREAD_FILE.exists():
-                THREAD_FILE.unlink()
+            session = self._session_from_id(data.get('session_id', ''))
+            if not session:
+                return
+            with _global_lock:
+                if session.thread_ts:
+                    _ts_to_session.pop(session.thread_ts, None)
+                    session.thread_ts = None
+                _saved_threads.pop(session.session_id, None)
+            _save_threads()
             self._send_json(200, {'ok': True})
 
         else:
@@ -346,6 +450,7 @@ def _unregister() -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    _load_saved_threads()
     _register()
     atexit.register(_unregister)
     threading.Thread(target=_poll_loop, daemon=True).start()

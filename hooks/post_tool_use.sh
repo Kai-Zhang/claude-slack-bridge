@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Code PostToolUse hook
-# Posts a brief summary of the completed tool call to the Slack task thread.
+# Posts a brief summary of the completed tool call to the session's Slack thread.
 # Read-only tools (Read, Glob, Grep) are skipped to keep the thread readable.
 
 set -euo pipefail
@@ -16,7 +16,8 @@ if ! curl -sf --max-time 2 "$BRIDGE_URL/health" > /dev/null 2>&1; then
 fi
 
 HOOK_INPUT=$(cat)
-TOOL_NAME=$(echo "$HOOK_INPUT" | jq -r '.tool_name // ""')
+SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
+TOOL_NAME=$(echo "$HOOK_INPUT"  | jq -r '.tool_name  // ""')
 TOOL_INPUT_JSON=$(echo "$HOOK_INPUT" | jq -c '.tool_input // {}')
 
 case "$TOOL_NAME" in
@@ -48,7 +49,10 @@ esac
 curl -sf --max-time 10 \
     -X POST "$BRIDGE_URL/send" \
     -H "Content-Type: application/json" \
-    -d "{\"text\": $(printf '%s' "$TEXT" | jq -Rs .)}" \
+    -d "{\"session_id\": $(printf '%s' "$SESSION_ID"       | jq -Rs .),
+         \"text\":       $(printf '%s' "$TEXT"             | jq -Rs .),
+         \"cwd\":        $(printf '%s' "$PWD"              | jq -Rs .),
+         \"task_title\": $(printf '%s' "${CLAUDE_TASK:-}"  | jq -Rs .)}" \
     > /dev/null
 
 exit 0

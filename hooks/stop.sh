@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Claude Code Stop hook
-# Sends a task-ended notice to the Slack thread, then resets the thread so
-# the next Claude session opens a fresh thread.
+# Posts a task-ended notice to the session's Slack thread.
+# Thread state is preserved so `claude --resume` continues in the same thread.
 
 set -euo pipefail
 
@@ -15,15 +15,14 @@ if ! curl -sf --max-time 2 "$BRIDGE_URL/health" > /dev/null 2>&1; then
     exit 0
 fi
 
+HOOK_INPUT=$(cat)
+SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
+
 curl -sf --max-time 10 \
     -X POST "$BRIDGE_URL/send" \
     -H "Content-Type: application/json" \
-    -d '{"text": "🏁 *Task ended* — Claude has finished or stopped."}' \
-    > /dev/null || true
-
-# Clear the thread so the next session starts a new Slack thread
-curl -sf --max-time 5 \
-    -X POST "$BRIDGE_URL/thread/reset" \
+    -d "{\"session_id\": $(printf '%s' "$SESSION_ID" | jq -Rs .),
+         \"text\": \"🏁 *Task ended* — Claude has finished or stopped.\"}" \
     > /dev/null || true
 
 exit 0

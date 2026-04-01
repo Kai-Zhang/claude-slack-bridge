@@ -3,8 +3,10 @@
 Claude Code Slack Bridge — Central Router
 
 Maintains a single Socket Mode connection to Slack and exposes an HTTP API
-for local bridge instances. Routes incoming Slack events to per-channel
-queues; proxies outbound messages from bridges to Slack.
+for local bridge instances. Routes Slack events to per-channel queues.
+
+All events include a `thread_ts` field when the Slack event occurred inside a
+thread. Bridges use this field to route events to the correct session.
 
 All HTTP endpoints require:  Authorization: Bearer <ROUTER_SECRET>
 
@@ -49,7 +51,7 @@ def _load_config(path: Path) -> Dict[str, str]:
 
 CONFIG_FILE = Path(__file__).parent / "router.conf"
 if not CONFIG_FILE.exists():
-    sys.exit(f"Error: {CONFIG_FILE} not found — copy router.conf.example and fill in your values.")
+    sys.exit(f"Error: {CONFIG_FILE} not found.")
 
 cfg = _load_config(CONFIG_FILE)
 
@@ -71,7 +73,7 @@ for _var, _val in [('SLACK_BOT_TOKEN', SLACK_BOT_TOKEN),
 # Event queues  (channel_id → [(enqueue_monotonic, event_dict), ...])
 # ---------------------------------------------------------------------------
 
-_lock = threading.Lock()
+_lock        = threading.Lock()
 _queues:     Dict[str, List[Tuple[float, dict]]] = {}
 _registered: set = set()
 
@@ -86,19 +88,17 @@ def _enqueue(channel_id: str, event: dict) -> None:
 def _dequeue_all(channel_id: str) -> List[dict]:
     with _lock:
         items = _queues.get(channel_id, [])
-        _queues[channel_id] = []        # clear but keep the key
+        _queues[channel_id] = []
         return [e for _, e in items]
 
 
 def _ttl_cleanup() -> None:
-    """Background thread: drop events older than EVENT_TTL seconds."""
     while True:
         time.sleep(60)
         cutoff = time.monotonic() - EVENT_TTL
         with _lock:
             for cid in list(_queues.keys()):
                 _queues[cid] = [(t, e) for t, e in _queues[cid] if t > cutoff]
-            # Remove empty queues for channels that are no longer registered
             for cid in list(_queues.keys()):
                 if cid not in _registered and not _queues[cid]:
                     del _queues[cid]
@@ -112,11 +112,10 @@ slack_app = App(token=SLACK_BOT_TOKEN)
 
 
 def _parse_inject(raw: str) -> str:
-    """Extract the payload from 'inject: foo' or 'inject foo'."""
+    """Extract payload from 'inject: foo' or 'inject foo'."""
     raw = raw.strip()
     if raw.lower().startswith('inject'):
-        rest = raw[6:].lstrip(': ')
-        return rest.strip()
+        return raw[6:].lstrip(': ').strip()
     return ''
 
 
@@ -127,9 +126,11 @@ def on_approve(ack, body, client):
     ack()
     channel_id = body['channel']['id']
     message_ts = body['message']['ts']
+    thread_ts  = body.get('container', {}).get('thread_ts', message_ts)
     _enqueue(channel_id, {
         "type":       "action",
         "action_id":  "claude_approve",
+        "thread_ts":  thread_ts,
         "user_id":    body['user']['id'],
         "channel_id": channel_id,
         "message_ts": message_ts,
@@ -148,9 +149,11 @@ def on_deny(ack, body, client):
     ack()
     channel_id = body['channel']['id']
     message_ts = body['message']['ts']
+    thread_ts  = body.get('container', {}).get('thread_ts', message_ts)
     _enqueue(channel_id, {
         "type":       "action",
         "action_id":  "claude_deny",
+        "thread_ts":  thread_ts,
         "user_id":    body['user']['id'],
         "channel_id": channel_id,
         "message_ts": message_ts,
@@ -164,65 +167,59 @@ def on_deny(ack, body, client):
     )
 
 
-# --- Slash commands ---
-
-@slack_app.command("/inject")
-def on_inject(ack, body, respond):
-    ack()
-    text = body.get('text', '').strip()
-    if not text:
-        respond("Usage: `/inject <message to Claude>`")
-        return
-    channel_id = body['channel_id']
-    _enqueue(channel_id, {
-        "type":    "inject",
-        "text":    text,
-        "user_id": body['user_id'],
-        "ts":      str(time.time()),
-    })
-    respond(f"Message queued for Claude: _{text}_")
-
-
-@slack_app.command("/stop")
-def on_stop(ack, body, respond):
-    ack()
-    channel_id = body['channel_id']
-    _enqueue(channel_id, {
-        "type":    "stop",
-        "user_id": body['user_id'],
-        "ts":      str(time.time()),
-    })
-    respond("Stop signal sent to Claude.")
-
-
-# --- @mention fallback ---
+# --- @mention handler (channel mode) ---
 
 @slack_app.event("app_mention")
 def on_mention(body, say):
-    event = body['event']
+    event      = body['event']
     channel_id = event['channel']
-    text = event.get('text', '')
+    thread_ts  = event.get('thread_ts')     # set only when reply is inside a thread
+    reply_ts   = thread_ts or event['ts']
+
     # Strip the leading @mention token (<@UXXXXX>)
-    parts = text.split(None, 1)
-    cmd = parts[1].strip() if len(parts) > 1 else ''
-    reply_ts = event.get('thread_ts') or event['ts']
+    raw  = event.get('text', '')
+    parts = raw.split(None, 1)
+    cmd   = parts[1].strip() if len(parts) > 1 else ''
     lower = cmd.lower()
 
+    if not thread_ts:
+        # Outside a thread — never execute commands
+        if lower in ('stop',) or lower.startswith('inject'):
+            say(
+                "Commands must be sent as a reply *within a session thread*.",
+                thread_ts=reply_ts,
+            )
+        else:
+            say(
+                "Reply within a session thread:\n• `stop`\n• `inject: <message>`",
+                thread_ts=reply_ts,
+            )
+        return
+
+    # Inside a thread — execute commands
     if lower == 'stop':
-        _enqueue(channel_id, {"type": "stop", "user_id": event['user'], "ts": str(time.time())})
+        _enqueue(channel_id, {
+            "type": "stop", "thread_ts": thread_ts,
+            "user_id": event['user'], "ts": str(time.time()),
+        })
         say("Stop signal queued for Claude.", thread_ts=reply_ts)
+
     elif lower.startswith('inject'):
         msg = _parse_inject(cmd)
         if msg:
-            _enqueue(channel_id, {"type": "inject", "text": msg, "user_id": event['user'], "ts": str(time.time())})
+            _enqueue(channel_id, {
+                "type": "inject", "text": msg, "thread_ts": thread_ts,
+                "user_id": event['user'], "ts": str(time.time()),
+            })
             say(f"Message queued for Claude: _{msg}_", thread_ts=reply_ts)
         else:
             say("Usage: `inject: <message>`", thread_ts=reply_ts)
+
     else:
         say("Commands: `stop`  |  `inject: <message>`", thread_ts=reply_ts)
 
 
-# --- DM messages ---
+# --- DM message handler ---
 
 @slack_app.event("message")
 def on_dm_message(body, say):
@@ -234,29 +231,51 @@ def on_dm_message(body, say):
         return
 
     channel_id = event['channel']
-    text = event.get('text', '').strip()
-    lower = text.lower()
+    text       = event.get('text', '').strip()
+    lower      = text.lower()
+    thread_ts  = event.get('thread_ts')     # set only when message is a thread reply
+    reply_ts   = thread_ts or event['ts']
 
-    # Setup helper: user asks for their channel ID
-    if lower in ('config', 'help', 'id'):
+    # Setup helper — always available outside threads
+    if lower in ('config', 'id') and not thread_ts:
         say(
             f"Your DM channel ID is: `{channel_id}`\n"
             f"Set this as `SLACK_CHANNEL_ID` in your `bridge.conf`."
         )
         return
 
+    if not thread_ts:
+        # Outside a thread — never execute commands
+        if lower in ('stop',) or lower.startswith('inject'):
+            say("Commands must be sent as a reply *within a session thread*.")
+        else:
+            say(
+                "Reply within a session thread:\n• `stop`\n• `inject: <message>`\n"
+                "Send `config` to get your DM channel ID."
+            )
+        return
+
+    # Inside a thread — execute commands
     if lower == 'stop':
-        _enqueue(channel_id, {"type": "stop", "user_id": event['user'], "ts": str(time.time())})
-        say("Stop signal queued for Claude.")
+        _enqueue(channel_id, {
+            "type": "stop", "thread_ts": thread_ts,
+            "user_id": event['user'], "ts": str(time.time()),
+        })
+        say("Stop signal queued for Claude.", thread_ts=reply_ts)
+
     elif lower.startswith('inject'):
         msg = _parse_inject(text)
         if msg:
-            _enqueue(channel_id, {"type": "inject", "text": msg, "user_id": event['user'], "ts": str(time.time())})
-            say(f"Message queued for Claude: _{msg}_")
+            _enqueue(channel_id, {
+                "type": "inject", "text": msg, "thread_ts": thread_ts,
+                "user_id": event['user'], "ts": str(time.time()),
+            })
+            say(f"Message queued for Claude: _{msg}_", thread_ts=reply_ts)
         else:
-            say("Usage: `inject: <message>`  or  `stop`")
+            say("Usage: `inject: <message>`  or  `stop`", thread_ts=reply_ts)
+
     else:
-        say("Commands: `stop`  |  `inject: <message>`\nSend `config` to get your channel ID.")
+        say("Commands: `stop`  |  `inject: <message>`", thread_ts=reply_ts)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +284,7 @@ def on_dm_message(body, say):
 
 class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        pass  # suppress access logs
+        pass
 
     def _send_json(self, status: int, data: dict) -> None:
         body = json.dumps(data).encode()
@@ -280,16 +299,13 @@ class _Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(n)) if n else {}
 
     def _auth_ok(self) -> bool:
-        auth = self.headers.get('Authorization', '')
-        return auth == f'Bearer {ROUTER_SECRET}'
+        return self.headers.get('Authorization', '') == f'Bearer {ROUTER_SECRET}'
 
     def _require_auth(self) -> bool:
         if not self._auth_ok():
             self._send_json(401, {'error': 'unauthorized'})
             return False
         return True
-
-    # --- GET ---
 
     def do_GET(self):
         if not self._require_auth():
@@ -307,13 +323,10 @@ class _Handler(BaseHTTPRequestHandler):
             if not channel_id:
                 self._send_json(400, {'error': 'channel_id query param required'})
                 return
-            events = _dequeue_all(channel_id)
-            self._send_json(200, {'ok': True, 'events': events})
+            self._send_json(200, {'ok': True, 'events': _dequeue_all(channel_id)})
 
         else:
             self._send_json(404, {'error': 'not found'})
-
-    # --- POST ---
 
     def do_POST(self):
         if not self._require_auth():
@@ -351,7 +364,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         elif path == '/update':
             channel_id = data.get('channel_id', '')
-            ts = data.get('ts', '')
+            ts         = data.get('ts', '')
             if not channel_id or not ts:
                 self._send_json(400, {'error': 'channel_id and ts required'})
                 return
@@ -366,8 +379,6 @@ class _Handler(BaseHTTPRequestHandler):
 
         else:
             self._send_json(404, {'error': 'not found'})
-
-    # --- DELETE ---
 
     def do_DELETE(self):
         if not self._require_auth():

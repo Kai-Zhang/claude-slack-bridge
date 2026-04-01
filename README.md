@@ -82,6 +82,7 @@ All Router HTTP endpoints require `Authorization: Bearer <ROUTER_SECRET>`. The s
 ## Documentation
 
 - **[Getting Started](docs/getting-started.md)** — create the Slack App, deploy the router, connect each user
+- **[Usage Guide](docs/usage.md)** — session model, commands, interaction flows, multi-session scenarios
 - **[Architecture](docs/architecture.md)** — component design, Router API reference, data flows
 
 ## Behaviour notes
