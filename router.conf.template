@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Claude Code Slack Bridge — Router Configuration
+# Deploy this file on the router machine only. Do not distribute to users.
+# ---------------------------------------------------------------------------
+
+# Slack tokens (required) — see docs/getting-started.md
+SLACK_BOT_TOKEN="xoxb-your-bot-token-here"
+SLACK_APP_TOKEN="xapp-your-app-token-here"
+
+# Shared secret — all bridge instances must use the same value.
+# Generate one with:  python3 -c "import secrets; print(secrets.token_hex(32))"
+ROUTER_SECRET="your-secret-here"
+
+# Interface to bind the HTTP API to.
+#   127.0.0.1  — local only (use this when a reverse proxy or Tailscale handles external access)
+#   0.0.0.0    — all interfaces (only if the machine is already firewalled)
+#   100.x.x.x  — a specific Tailscale IP
+ROUTER_HOST=127.0.0.1
+
+# Port that local bridges connect to (must be reachable from user machines)
+ROUTER_PORT=8765
+
+# Seconds to keep undelivered events before discarding them
+EVENT_TTL=300

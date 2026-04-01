@@ -1,0 +1,17 @@
+# Credentials — never commit these
+router.conf
+bridge.conf
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Runtime state files
+/tmp/claude_thread_ts
+/tmp/claude_inbox
+
+# OS
+.DS_Store

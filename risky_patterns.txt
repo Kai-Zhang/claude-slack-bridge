@@ -1,0 +1,25 @@
+# Commands matching these patterns (case-insensitive substring match) will
+# require Slack approval before Claude executes them.
+# One pattern per line; lines starting with # are ignored.
+
+# Kubernetes — destructive
+kubectl delete
+kubectl drain
+kubectl cordon
+kubectl taint nodes
+
+# Helm — destructive
+helm uninstall
+helm delete
+
+# Shell — destructive
+rm -rf
+git reset --hard
+git push --force
+git push -f
+git clean -fd
+
+# Database — destructive (common SQL keywords)
+DROP TABLE
+DROP DATABASE
+TRUNCATE TABLE

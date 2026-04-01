@@ -1,0 +1,29 @@
+# ---------------------------------------------------------------------------
+# Claude Code Slack Bridge — Local Bridge Configuration
+# Fill in ROUTER_URL, ROUTER_SECRET, and SLACK_CHANNEL_ID.
+# Ask your admin for the router URL and shared secret.
+# ---------------------------------------------------------------------------
+
+# URL of the central router (required)
+ROUTER_URL="http://your-router-host:8765"
+
+# Shared secret — must match ROUTER_SECRET in router.conf (required)
+ROUTER_SECRET="your-secret-here"
+
+# Your Slack channel or DM channel ID (required)
+# DM mode:      starts with D  — find it by DMing the bot "config"
+# Channel mode: starts with C  — right-click the channel → View channel details
+SLACK_CHANNEL_ID="C0123456789"
+
+# Local port used for hook ↔ bridge communication
+BRIDGE_PORT=9876
+
+# Seconds to wait for an approval response before timing out
+APPROVAL_TIMEOUT=1800
+
+# What to do when approval times out: deny | approve
+APPROVAL_DEFAULT=deny
+
+# State file paths (defaults are fine for most setups)
+THREAD_FILE=/tmp/claude_thread_ts
+INBOX_FILE=/tmp/claude_inbox
