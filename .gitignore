@@ -12,6 +12,7 @@ venv/
 # Runtime state files
 /tmp/claude_thread_ts
 /tmp/claude_inbox
+.remote_approve
 
 # OS
 .DS_Store

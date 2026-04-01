@@ -55,20 +55,20 @@ Open **https://api.slack.com/apps** and sign in to your workspace.
 1. Left sidebar → **Slash Commands** → **Create New Command**
 
    **Command 1**
-   - Command: `/inject`
+   - Command: `/remote-on`
    - Request URL: `https://placeholder.example.com` *(Socket Mode ignores this)*
-   - Short description: `Send a message to Claude`
+   - Short description: `Enable remote approval`
    - Click **Save**
 
    **Command 2**
-   - Command: `/stop`
+   - Command: `/remote-off`
    - Request URL: `https://placeholder.example.com`
-   - Short description: `Stop Claude's current task`
+   - Short description: `Disable remote approval`
    - Click **Save**
 
 #### 1.5 — Enable DM messages
 
-This allows users to send messages to the bot directly in the DM tab (required for DM mode commands and the `config` channel ID helper).
+This allows users to send messages to the bot directly in the DM tab (required for DM mode `away` / `back` messages and the `config` channel ID helper).
 
 1. Left sidebar → **App Home**
 2. Under **Show Tabs**, check **Allow users to send Slash commands and messages from the messaging tab**

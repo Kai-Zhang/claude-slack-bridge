@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Claude Code PreToolUse hook
 #
-# Two responsibilities:
-#   1. Deliver queued inject/stop messages to Claude before the next tool runs.
-#   2. Block risky operations and wait for Slack approval.
+# Responsibilities:
+#   1. On first call of a session: ensure the Slack thread exists so the user
+#      can interact with it (e.g. send @bot away) before any tool output arrives.
+#   2. Deliver queued inject/stop messages to Claude before the next tool runs.
+#   3. Block commands matching risky_patterns.txt and wait for Slack approval.
+#      (Always active when the bridge is running, regardless of .remote_approve.)
+#   4. If .remote_approve exists, forward all permission-requiring tool calls to
+#      Slack and wait for approval. Mirrors the CLI "yes/yes to all/no" prompt.
 #
 # Exit codes (Claude Code convention):
 #   0  — allow the tool call to proceed
@@ -24,12 +29,29 @@ fi
 
 # Parse hook input (JSON on stdin)
 HOOK_INPUT=$(cat)
-SESSION_ID=$(echo "$HOOK_INPUT" | jq -r '.session_id // ""')
-TOOL_NAME=$(echo "$HOOK_INPUT"  | jq -r '.tool_name  // ""')
+SESSION_ID=$(echo "$HOOK_INPUT"  | jq -r '.session_id // ""')
+TOOL_NAME=$(echo "$HOOK_INPUT"   | jq -r '.tool_name  // ""')
 TOOL_INPUT_JSON=$(echo "$HOOK_INPUT" | jq -c '.tool_input // {}')
 
 # ---------------------------------------------------------------------------
-# 1. Check inbox for inject / stop messages
+# 1. Ensure the Slack thread exists on the first call of this session.
+#    This guarantees a thread is available for @bot away before any tool runs.
+# ---------------------------------------------------------------------------
+FIRST_CALL_MARKER="/tmp/claude_bridge_started_${SESSION_ID}"
+if [[ ! -f "$FIRST_CALL_MARKER" ]]; then
+    if curl -sf --max-time 5 \
+        -X POST "$BRIDGE_URL/session/start" \
+        -H "Content-Type: application/json" \
+        -d "{\"session_id\": $(printf '%s' "$SESSION_ID"     | jq -Rs .),
+             \"cwd\":        $(printf '%s' "$PWD"             | jq -Rs .),
+             \"task_title\": $(printf '%s' "${CLAUDE_TASK:-}" | jq -Rs .)}" \
+        > /dev/null 2>&1; then
+        touch "$FIRST_CALL_MARKER"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Check inbox for inject / stop messages
 # ---------------------------------------------------------------------------
 INBOX_RESPONSE=$(curl -sf --max-time 5 \
     "${BRIDGE_URL}/inbox?session_id=${SESSION_ID}" 2>/dev/null \
@@ -50,56 +72,71 @@ if [[ -n "$MESSAGES" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Check if this tool call requires approval
+# 3. Determine whether this tool call requires Slack approval
 # ---------------------------------------------------------------------------
-requires_approval() {
-    [[ "$TOOL_NAME" != "Bash" ]] && return 1
 
-    local command
-    command=$(echo "$TOOL_INPUT_JSON" | jq -r '.command // ""')
-    local patterns_file="$BRIDGE_DIR/risky_patterns.txt"
-    [[ ! -f "$patterns_file" ]] && return 1
-
+# Check risky_patterns.txt (always active; sets IS_RISKY flag for card label)
+IS_RISKY="false"
+PATTERNS_FILE="$BRIDGE_DIR/risky_patterns.txt"
+if [[ "$TOOL_NAME" == "Bash" && -f "$PATTERNS_FILE" ]]; then
+    COMMAND=$(echo "$TOOL_INPUT_JSON" | jq -r '.command // ""')
     while IFS= read -r pattern; do
         [[ -z "$pattern" || "$pattern" == \#* ]] && continue
-        if echo "$command" | grep -qi -- "$pattern"; then
-            return 0
+        if echo "$COMMAND" | grep -qi -- "$pattern"; then
+            IS_RISKY="true"
+            break
         fi
-    done < "$patterns_file"
-    return 1
-}
-
-if requires_approval; then
-    COMMAND=$(echo "$TOOL_INPUT_JSON" | jq -r '.command // ""')
-    TIMEOUT="${APPROVAL_TIMEOUT:-1800}"
-
-    RESPONSE=$(curl -sf \
-        --max-time "$((TIMEOUT + 30))" \
-        -X POST "$BRIDGE_URL/approval" \
-        -H "Content-Type: application/json" \
-        -d "{\"session_id\": $(printf '%s' "$SESSION_ID"  | jq -Rs .),
-             \"tool\":       $(printf '%s' "$TOOL_NAME"   | jq -Rs .),
-             \"command\":    $(printf '%s' "$COMMAND"     | jq -Rs .),
-             \"cwd\":        $(printf '%s' "$PWD"         | jq -Rs .),
-             \"task_title\": $(printf '%s' "${CLAUDE_TASK:-}" | jq -Rs .)}" \
-        2>/dev/null) || {
-        echo "⚠️ Could not reach bridge during approval request. Operation denied."
-        exit 2
-    }
-
-    DECISION=$(echo "$RESPONSE" | jq -r '.decision // "deny"')
-    REASON=$(echo "$RESPONSE"   | jq -r '.reason   // ""')
-
-    if [[ "$DECISION" == "approved" ]]; then
-        exit 0
-    fi
-
-    case "$REASON" in
-        timeout)        echo "⏰ No approval received within ${TIMEOUT}s. Operation denied." ;;
-        stop_requested) echo "🛑 Stop signal received during approval wait. Halting execution." ;;
-        *)              echo "❌ Operation denied via Slack." ;;
-    esac
-    exit 2
+    done < "$PATTERNS_FILE"
 fi
 
-exit 0
+# Check remote approval (.remote_approve file gates this path)
+NEEDS_APPROVAL="$IS_RISKY"
+if [[ "$NEEDS_APPROVAL" == "false" && -f "$BRIDGE_DIR/.remote_approve" ]]; then
+    _PTOOLS="${PERMISSION_TOOLS:-Edit MultiEdit Write Bash NotebookEdit}"
+    for _pt in $_PTOOLS; do
+        if [[ "$TOOL_NAME" == "$_pt" ]]; then
+            NEEDS_APPROVAL="true"
+            break
+        fi
+    done
+fi
+
+[[ "$NEEDS_APPROVAL" == "false" ]] && exit 0
+
+# ---------------------------------------------------------------------------
+# 4. Request Slack approval — blocks until the user responds or sends @bot stop.
+#    No timeout: mirrors the CLI behaviour where Claude waits indefinitely.
+# ---------------------------------------------------------------------------
+RESPONSE=$(curl -sf \
+    --max-time 0 \
+    -X POST "$BRIDGE_URL/approval" \
+    -H "Content-Type: application/json" \
+    -d "{\"session_id\": $(printf '%s' "$SESSION_ID"     | jq -Rs .),
+         \"tool\":       $(printf '%s' "$TOOL_NAME"      | jq -Rs .),
+         \"tool_input\": $TOOL_INPUT_JSON,
+         \"is_risky\":   $IS_RISKY,
+         \"cwd\":        $(printf '%s' "$PWD"            | jq -Rs .),
+         \"task_title\": $(printf '%s' "${CLAUDE_TASK:-}" | jq -Rs .)}" \
+    2>/dev/null) || {
+    echo "⚠️ Could not reach bridge during approval request. Operation denied."
+    exit 2
+}
+
+DECISION=$(echo "$RESPONSE"    | jq -r '.decision    // "denied"')
+DENY_REASON=$(echo "$RESPONSE" | jq -r '.deny_reason // ""')
+
+if [[ "$DECISION" == "approved" ]]; then
+    exit 0
+fi
+
+case "$(echo "$RESPONSE" | jq -r '.reason // ""')" in
+    stop_requested) echo "🛑 Stop signal received during approval wait. Halting execution." ;;
+    *)
+        if [[ -n "$DENY_REASON" ]]; then
+            echo "❌ Denied: $DENY_REASON"
+        else
+            echo "❌ Operation denied via Slack."
+        fi
+        ;;
+esac
+exit 2

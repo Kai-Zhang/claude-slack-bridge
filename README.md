@@ -14,8 +14,8 @@ Claude runs: kubectl delete namespace production
 ```
 
 ```
-you send: /inject focus on staging, not prod
-  → Claude receives the note before its next action
+you send: /remote-on
+  → future permission prompts forward to Slack until /remote-off
 ```
 
 ## Multi-user design
@@ -43,10 +43,12 @@ Slack ←── Socket Mode ──→ [Central Router]
 
 | Command | Where | Effect |
 |---|---|---|
-| `/inject <message>` | slash command | Delivers a message to Claude before its next tool call |
-| `/stop` | slash command | Stops Claude before its next tool call |
-| `@bot inject: <message>` | @mention | Same as `/inject` (fallback) |
-| `@bot stop` | @mention | Same as `/stop` (fallback) |
+| `/remote-on` | slash command | Enable remote approval globally for this bridge |
+| `/remote-off` | slash command | Disable remote approval globally for this bridge |
+| `@bot away` | top-level @mention or DM message | Same as `/remote-on` |
+| `@bot back` | top-level @mention or DM message | Same as `/remote-off` |
+| `@bot inject: <message>` | reply inside a session thread | Delivers a message to Claude before its next tool call |
+| `@bot stop` | reply inside a session thread | Stops Claude before its next tool call |
 | **✅ Approve** | approval card | Allows the blocked operation to proceed |
 | **❌ Deny** | approval card | Blocks the operation; Claude receives a denial |
 
@@ -90,6 +92,6 @@ All Router HTTP endpoints require `Authorization: Bearer <ROUTER_SECRET>`. The s
 - **Bridge not running:** hooks exit 0 immediately — Claude operates normally, no interruption
 - **Router not reachable:** bridge behaves as if not running — fail open
 - **Approval timeout:** resolves to `APPROVAL_DEFAULT` (deny by default)
-- **`/stop` during approval wait:** cancels the pending approval and halts Claude
+- **`@bot stop` during approval wait:** cancels the pending approval and halts Claude
 - **Router restart:** in-memory event queues are cleared; active approval waits time out; bridges reconnect automatically on next poll
 - **Bridge restart mid-session:** thread resumes — thread timestamp is persisted to `THREAD_FILE` on disk

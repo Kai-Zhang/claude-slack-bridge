@@ -70,7 +70,7 @@ Three shell scripts wired into Claude Code's hook system via `~/.claude/settings
 
 | Hook | Trigger | Action |
 |---|---|---|
-| `pre_tool_use.sh` | Before every tool call | Read inbox (deliver inject/stop); check command against `risky_patterns.txt`; if risky, call `/approval` and block |
+| `pre_tool_use.sh` | Before every tool call | On first call of a session, ensure the Slack thread exists. Read inbox (deliver inject/stop). If command matches `risky_patterns.txt`, call `/approval` and block. If `.remote_approve` exists, call `/approval` for all permission-requiring tools and block. |
 | `post_tool_use.sh` | After every tool call | Post a summary line to the session thread via `/send` |
 | `stop.sh` | When Claude finishes | Post a session-ended notice via `/send`; call `/thread/reset` |
 
@@ -208,10 +208,12 @@ Events delivered via `GET /events`:
 
 | `type` | `action_id` / content | Produced by |
 |---|---|---|
-| `action` | `claude_approve` | User clicks Approve button |
-| `action` | `claude_deny` | User clicks Deny button |
-| `inject` | `text` contains the message | `/inject` slash command, @mention, or DM |
-| `stop` | — | `/stop` slash command, @mention, or DM |
+| `action` | `claude_approve` | User clicks Yes |
+| `action` | `claude_approve_all` | User clicks Yes to All |
+| `action` | `claude_deny` (+ optional `deny_reason`) | User submits the No modal |
+| `inject` | `text` contains the message | `@bot inject:` mention or DM |
+| `stop` | — | `@bot stop` mention or DM |
+| `mode` | `away` or `back` | `/remote-on`, `/remote-off`, or top-level `away` / `back` message |
 
 ---
 
@@ -247,19 +249,16 @@ Local Bridge poll returns the action event
   → Claude: proceeds with the command
 ```
 
-### Inject / stop flow
+### Away / back flow
 
 ```
-User types /inject fix the import order first in their channel
+User types /remote-on in their channel
   → Slack: slash_command event → Router via Socket Mode
-  → Router: enqueue {type:"command", text:"fix the import order first"} for channel
+  → Router: enqueue {type:"mode", value:"away"} for channel
 
-Between tool calls, pre_tool_use.sh calls GET localhost:9876/inbox
-  → Local Bridge: GET router:8765/events → receives the command event
-  → Local Bridge: appends message to INBOX_FILE
-  → /inbox response: {"messages": ["fix the import order first"]}
-  → pre_tool_use.sh: writes message to Claude's stdin
-  → Claude: reads the note and adjusts its plan
+Local Bridge poll returns the mode event
+  → Local Bridge: create .remote_approve
+  → future permission prompts are forwarded to Slack
 ```
 
 ---
@@ -284,8 +283,7 @@ Between tool calls, pre_tool_use.sh calls GET localhost:9876/inbox
 | `ROUTER_SECRET` | Yes | Shared secret; must match `ROUTER_SECRET` in `router.conf` |
 | `SLACK_CHANNEL_ID` | Yes | Channel (`C…`) or DM (`D…`) this bridge is associated with |
 | `BRIDGE_PORT` | No (default `9876`) | Local port for hook ↔ bridge communication |
-| `APPROVAL_TIMEOUT` | No (default `1800`) | Seconds to wait for an approval response |
-| `APPROVAL_DEFAULT` | No (default `deny`) | Decision on timeout: `deny` or `approve` |
+| `PERMISSION_TOOLS` | No (default: common write tools) | Space-separated list of tool names that trigger remote approval when `.remote_approve` is active |
 | `THREAD_FILE` | No (default `/tmp/claude_threads.json`) | JSON file persisting `session_id → thread_ts` mappings |
 
 ---
@@ -318,8 +316,10 @@ Each active session in the bridge holds independent state:
 | State | Description |
 |---|---|
 | `thread_ts` | Slack thread timestamp; identifies the session's thread |
-| `approval_event` | Threading event signalled when an approve/deny arrives |
+| `approval_event` | Threading event signalled when an approval decision arrives |
 | `approval_result` | `'approved'` or `'denied'`, set before signalling |
+| `approval_deny_reason` | Optional free-text reason supplied when the user clicks No |
+| `approve_all` | Set of tool types the user has approved for the rest of the session (populated on "Yes to All") |
 | `inbox` | In-memory queue of inject/stop messages |
 
 ### Event routing within the bridge
@@ -329,7 +329,8 @@ The Router continues to route events by `channel_id`. The bridge maintains a rev
 - `block_actions` (button click): Router extracts `container.thread_ts` → bridge matches session
 - `app_mention` in thread: Router extracts `event.thread_ts` → bridge matches session
 - `message.im` in thread: Router extracts `event.thread_ts` → bridge matches session
-- Events with no `thread_ts`: rejected at the router level; inject/stop are not executed
+- Thread-scoped commands require `thread_ts`; `inject` and `stop` are ignored outside a session thread
+- Global mode toggles do not require `thread_ts`; `away` and `back` are applied bridge-wide
 
 ---
 
@@ -346,3 +347,34 @@ Keeping the bot token on the router only limits the blast radius of a misconfigu
 
 **Why does the router hold no per-user config?**
 Routing solely by `channel_id` means adding or removing a user requires zero router changes. A bridge registers when it starts and unregisters when it stops. The router is stateless with respect to user identity.
+
+**Two approval features with different activation conditions**
+
+The bridge has two distinct approval mechanisms that coexist independently:
+
+| Feature | Active when | What triggers it |
+|---|---|---|
+| Risky-pattern gating | Bridge is running | Commands matching `risky_patterns.txt` |
+| Permission forwarding | Bridge running + `.remote_approve` exists | All tools in `PERMISSION_TOOLS` that Claude Code would normally prompt for |
+
+When both apply to the same operation (a risky command that also triggers a permission prompt), a single card is sent with the high-risk label — no double prompting from the bridge.
+
+**Why notifications are unconditional but approvals are opt-in**
+
+Session start/end and tool activity summaries are a passive log of what Claude is doing — always useful, no user action required. Approval forwarding blocks Claude until the user responds, so it is only appropriate when the user is genuinely away. Keeping notifications unconditional ensures the user can still send thread-scoped commands like `inject` and `stop` at any point, while remote approval itself remains a bridge-wide toggle.
+
+**Why "Yes to All" is scoped per tool type**
+
+Claude Code's native "Yes, don't ask again this session" is also scoped by operation type. Matching this granularity prevents a situation where approving all file edits accidentally silences Bash command prompts — two categories of operation with very different risk profiles.
+
+**Why permission forwarding has no timeout**
+
+The CLI does not time out — Claude waits indefinitely for user input. Permission forwarding matches this behaviour exactly. The only cancellation path is an explicit `@bot stop`.
+
+**Why Claude must run with `--dangerously-skip-permissions`**
+
+The hook runs before Claude Code's own permission check. In default interactive mode, CC's dialog appears after the hook returns — the user would face a Slack card and then a CLI prompt for the same operation. Running with `--dangerously-skip-permissions` removes CC's dialog and makes the hook the sole permission gate. Risky-pattern gating also benefits: it can block operations that CC would otherwise auto-approve in non-interactive mode.
+
+**"No with reason" uses a Slack modal**
+
+When the user clicks No, a Slack modal opens for optional free-text input. The text is forwarded to the hook, printed to Claude's stdout, and Claude reads it as guidance for its next attempt. An empty submission produces a plain denial with no extra feedback. This matches the CLI "No, and explain why" option.

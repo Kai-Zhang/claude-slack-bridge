@@ -119,6 +119,39 @@ def _parse_inject(raw: str) -> str:
     return ''
 
 
+def _mode_text(value: str) -> str:
+    if value == 'away':
+        return "Remote approval enabled. Permission prompts will forward to Slack. 🛫"
+    return "Remote approval disabled. Permission prompts return to the CLI. 🛬"
+
+
+def _enqueue_mode(channel_id: str, value: str, user_id: str) -> str:
+    _enqueue(channel_id, {
+        "type":    "mode",
+        "value":   value,
+        "user_id": user_id,
+        "ts":      str(time.time()),
+    })
+    return _mode_text(value)
+
+
+def _mode_thread_error() -> str:
+    return (
+        "`away` and `back` are global commands and do not run inside a session thread.\n"
+        "Use `/remote-on`, `/remote-off`, or send `@bot away` / `@bot back` as a top-level message."
+    )
+
+
+@slack_app.command("/remote-on")
+def on_remote_on_command(ack, body):
+    ack(_enqueue_mode(body['channel_id'], 'away', body['user_id']))
+
+
+@slack_app.command("/remote-off")
+def on_remote_off_command(ack, body):
+    ack(_enqueue_mode(body['channel_id'], 'back', body['user_id']))
+
+
 # --- Approval button handlers ---
 
 @slack_app.action("claude_approve")
@@ -136,11 +169,41 @@ def on_approve(ack, body, client):
         "message_ts": message_ts,
         "ts":         str(time.time()),
     })
+    content_blocks = [b for b in body['message'].get('blocks', [])
+                      if b.get('type') != 'actions']
     client.chat_update(
         channel=channel_id,
         ts=message_ts,
-        text="✅ Approved",
-        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Approved*"}}],
+        text="✅ Yes",
+        blocks=content_blocks + [{"type": "section", "text": {"type": "mrkdwn", "text": "✅ *Yes*"}}],
+    )
+
+
+@slack_app.action("claude_approve_all")
+def on_approve_all(ack, body, client):
+    ack()
+    channel_id = body['channel']['id']
+    message_ts = body['message']['ts']
+    thread_ts  = body.get('container', {}).get('thread_ts', message_ts)
+    tool_type  = body['actions'][0].get('value', '')
+    _enqueue(channel_id, {
+        "type":       "action",
+        "action_id":  "claude_approve_all",
+        "tool_type":  tool_type,
+        "thread_ts":  thread_ts,
+        "user_id":    body['user']['id'],
+        "channel_id": channel_id,
+        "message_ts": message_ts,
+        "ts":         str(time.time()),
+    })
+    label = f"Yes to All (`{tool_type}`)" if tool_type else "Yes to All"
+    content_blocks = [b for b in body['message'].get('blocks', [])
+                      if b.get('type') != 'actions']
+    client.chat_update(
+        channel=channel_id,
+        ts=message_ts,
+        text=f"✅ {label}",
+        blocks=content_blocks + [{"type": "section", "text": {"type": "mrkdwn", "text": f"✅ *{label}*"}}],
     )
 
 
@@ -150,20 +213,108 @@ def on_deny(ack, body, client):
     channel_id = body['channel']['id']
     message_ts = body['message']['ts']
     thread_ts  = body.get('container', {}).get('thread_ts', message_ts)
-    _enqueue(channel_id, {
-        "type":       "action",
-        "action_id":  "claude_deny",
-        "thread_ts":  thread_ts,
-        "user_id":    body['user']['id'],
+
+    private_metadata = json.dumps({
         "channel_id": channel_id,
         "message_ts": message_ts,
-        "ts":         str(time.time()),
+        "thread_ts":  thread_ts,
     })
+
+    try:
+        client.views_open(
+            trigger_id=body['trigger_id'],
+            view={
+                "type":             "modal",
+                "callback_id":      "claude_deny_modal",
+                "private_metadata": private_metadata,
+                "title":            {"type": "plain_text", "text": "Deny operation"},
+                "submit":           {"type": "plain_text", "text": "Deny"},
+                "close":            {"type": "plain_text", "text": "Cancel"},
+                "blocks": [
+                    {
+                        "type":     "input",
+                        "block_id": "reason_block",
+                        "optional": True,
+                        "label":    {"type": "plain_text", "text": "Reason for Claude (optional)"},
+                        "element":  {
+                            "type":        "plain_text_input",
+                            "action_id":   "reason_input",
+                            "multiline":   True,
+                            "placeholder": {
+                                "type": "plain_text",
+                                "text": "Explain why, or leave empty for a plain denial",
+                            },
+                        },
+                    },
+                ],
+            },
+        )
+    except Exception:
+        # Fallback: deny immediately if modal cannot open (e.g. trigger_id expired)
+        _enqueue(channel_id, {
+            "type":       "action",
+            "action_id":  "claude_deny",
+            "thread_ts":  thread_ts,
+            "user_id":    body['user']['id'],
+            "channel_id": channel_id,
+            "message_ts": message_ts,
+            "ts":         str(time.time()),
+        })
+        content_blocks = [b for b in body['message'].get('blocks', [])
+                          if b.get('type') != 'actions']
+        client.chat_update(
+            channel=channel_id,
+            ts=message_ts,
+            text="❌ No",
+            blocks=content_blocks + [{"type": "section", "text": {"type": "mrkdwn", "text": "❌ *No*"}}],
+        )
+
+
+@slack_app.view("claude_deny_modal")
+def on_deny_modal_submit(ack, body, client):
+    ack()
+    metadata   = json.loads(body['view']['private_metadata'])
+    channel_id = metadata['channel_id']
+    message_ts = metadata['message_ts']
+    thread_ts  = metadata['thread_ts']
+
+    values = body['view']['state']['values']
+    reason = (values.get('reason_block', {})
+                    .get('reason_input', {})
+                    .get('value') or '').strip()
+
+    _enqueue(channel_id, {
+        "type":        "action",
+        "action_id":   "claude_deny",
+        "deny_reason": reason or None,
+        "thread_ts":   thread_ts,
+        "user_id":     body['user']['id'],
+        "channel_id":  channel_id,
+        "message_ts":  message_ts,
+        "ts":          str(time.time()),
+    })
+
+    deny_text = "❌ *No*"
+    if reason:
+        deny_text += f"\n> {reason}"
+
+    content_blocks: list = []
+    try:
+        history = client.conversations_history(
+            channel=channel_id, latest=message_ts, limit=1, inclusive=True,
+        )
+        msgs = history.get('messages') or []
+        if msgs:
+            content_blocks = [b for b in (msgs[0].get('blocks') or [])
+                               if b.get('type') != 'actions']
+    except Exception:
+        pass
+
     client.chat_update(
         channel=channel_id,
         ts=message_ts,
-        text="❌ Denied",
-        blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "❌ *Denied*"}}],
+        text="❌ No",
+        blocks=content_blocks + [{"type": "section", "text": {"type": "mrkdwn", "text": deny_text}}],
     )
 
 
@@ -182,8 +333,15 @@ def on_mention(body, say):
     cmd   = parts[1].strip() if len(parts) > 1 else ''
     lower = cmd.lower()
 
+    if lower in ('away', 'back'):
+        if thread_ts:
+            say(_mode_thread_error(), thread_ts=reply_ts)
+        else:
+            say(_enqueue_mode(channel_id, lower, event['user']), thread_ts=reply_ts)
+        return
+
     if not thread_ts:
-        # Outside a thread — never execute commands
+        # Outside a thread — never execute session commands
         if lower in ('stop',) or lower.startswith('inject'):
             say(
                 "Commands must be sent as a reply *within a session thread*.",
@@ -191,12 +349,17 @@ def on_mention(body, say):
             )
         else:
             say(
-                "Reply within a session thread:\n• `stop`\n• `inject: <message>`",
+                "Reply within a session thread:\n"
+                "• `stop`\n"
+                "• `inject: <message>`\n\n"
+                "Global commands:\n"
+                "• `/remote-on` or top-level `@bot away`\n"
+                "• `/remote-off` or top-level `@bot back`",
                 thread_ts=reply_ts,
             )
         return
 
-    # Inside a thread — execute commands
+    # Inside a thread — execute session commands
     if lower == 'stop':
         _enqueue(channel_id, {
             "type": "stop", "thread_ts": thread_ts,
@@ -232,6 +395,10 @@ def on_dm_message(body, say):
 
     channel_id = event['channel']
     text       = event.get('text', '').strip()
+    # Strip leading @mention if present (user may @mention the bot even in a DM)
+    _parts = text.split(None, 1)
+    if _parts and _parts[0].startswith('<@') and _parts[0].endswith('>'):
+        text = _parts[1].strip() if len(_parts) > 1 else ''
     lower      = text.lower()
     thread_ts  = event.get('thread_ts')     # set only when message is a thread reply
     reply_ts   = thread_ts or event['ts']
@@ -244,18 +411,30 @@ def on_dm_message(body, say):
         )
         return
 
+    if lower in ('away', 'back'):
+        if thread_ts:
+            say(_mode_thread_error(), thread_ts=reply_ts)
+        else:
+            say(_enqueue_mode(channel_id, lower, event['user']))
+        return
+
     if not thread_ts:
-        # Outside a thread — never execute commands
+        # Outside a thread — never execute session commands
         if lower in ('stop',) or lower.startswith('inject'):
             say("Commands must be sent as a reply *within a session thread*.")
         else:
             say(
-                "Reply within a session thread:\n• `stop`\n• `inject: <message>`\n"
+                "Reply within a session thread:\n"
+                "• `stop`\n"
+                "• `inject: <message>`\n\n"
+                "Global commands:\n"
+                "• `/remote-on` or top-level `away`\n"
+                "• `/remote-off` or top-level `back`\n\n"
                 "Send `config` to get your DM channel ID."
             )
         return
 
-    # Inside a thread — execute commands
+    # Inside a thread — execute session commands
     if lower == 'stop':
         _enqueue(channel_id, {
             "type": "stop", "thread_ts": thread_ts,

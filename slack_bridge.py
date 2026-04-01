@@ -56,9 +56,9 @@ ROUTER_URL       = cfg.get('ROUTER_URL', '').rstrip('/')
 ROUTER_SECRET    = cfg.get('ROUTER_SECRET', '')
 SLACK_CHANNEL_ID = cfg.get('SLACK_CHANNEL_ID', '')
 BRIDGE_PORT      = int(cfg.get('BRIDGE_PORT', 9876))
-APPROVAL_TIMEOUT = int(cfg.get('APPROVAL_TIMEOUT', 1800))
-APPROVAL_DEFAULT = cfg.get('APPROVAL_DEFAULT', 'deny')
 THREAD_FILE      = Path(cfg.get('THREAD_FILE', '/tmp/claude_threads.json'))
+
+REMOTE_APPROVE_FILE = Path(__file__).parent / '.remote_approve'
 
 for _var, _val in [('ROUTER_URL',       ROUTER_URL),
                    ('ROUTER_SECRET',    ROUTER_SECRET),
@@ -79,6 +79,8 @@ class _Session:
         self.cwd:        Optional[str] = None   # working dir of the Claude process
         self.approval_event        = threading.Event()
         self.approval_result: Optional[str] = None   # 'approved' | 'denied'
+        self.approval_deny_reason: Optional[str] = None  # text from No modal
+        self.approve_all:  set     = set()       # tool types approved for session
         self.waiting_for_approval  = False
         self.inbox:      List[str] = []
         self.inbox_lock            = threading.Lock()
@@ -173,6 +175,32 @@ def _router_post(text: str, thread_ts: Optional[str] = None,
 # Thread management
 # ---------------------------------------------------------------------------
 
+def _format_tool_display(tool: str, tool_input: dict) -> str:
+    """Return a short mrkdwn summary of the tool call for an approval card."""
+    if tool == 'Bash':
+        cmd = (tool_input.get('command') or '')[:500]
+        return f"```{cmd}```"
+    if tool in ('Edit', 'MultiEdit'):
+        path = tool_input.get('file_path') or tool_input.get('path') or ''
+        old  = (tool_input.get('old_string') or '')
+        new  = (tool_input.get('new_string') or '')
+        lines: List[str] = [f"`{path}`"]
+        for ln in old.splitlines()[:5]:
+            lines.append(f"− {ln}")
+        for ln in new.splitlines()[:5]:
+            lines.append(f"+ {ln}")
+        return '\n'.join(lines)
+    if tool == 'Write':
+        path = tool_input.get('file_path') or tool_input.get('path') or ''
+        return f"`{path}`"
+    if tool == 'NotebookEdit':
+        path = tool_input.get('notebook_path') or tool_input.get('path') or ''
+        return f"notebook `{path}`"
+    # Generic fallback: first few key-value pairs
+    items = [(k, str(v)[:100]) for k, v in list(tool_input.items())[:3]]
+    return '\n'.join(f"`{k}`: {v}" for k, v in items) or f"`{tool}`"
+
+
 def _build_thread_title(session: _Session) -> str:
     cwd = session.cwd or os.getcwd()
     try:
@@ -225,6 +253,17 @@ def _post_to_thread(session: _Session, text: str,
 # ---------------------------------------------------------------------------
 
 def _handle_event(event: dict) -> None:
+    etype = event.get('type')
+
+    # Mode events are global — create or remove .remote_approve file.
+    if etype == 'mode':
+        value = event.get('value', '')
+        if value == 'away':
+            REMOTE_APPROVE_FILE.touch()
+        elif value == 'back':
+            REMOTE_APPROVE_FILE.unlink(missing_ok=True)
+        return
+
     thread_ts = event.get('thread_ts')
     if not thread_ts:
         return
@@ -236,12 +275,20 @@ def _handle_event(event: dict) -> None:
     if not session:
         return
 
-    etype = event.get('type')
-
     if etype == 'action':
         action_id = event.get('action_id', '')
-        if action_id in ('claude_approve', 'claude_deny'):
-            session.approval_result = 'approved' if action_id == 'claude_approve' else 'denied'
+        if action_id == 'claude_approve':
+            session.approval_result = 'approved'
+            session.approval_event.set()
+        elif action_id == 'claude_approve_all':
+            tool_type = event.get('tool_type', '')
+            if tool_type:
+                session.approve_all.add(tool_type)
+            session.approval_result = 'approved'
+            session.approval_event.set()
+        elif action_id == 'claude_deny':
+            session.approval_result      = 'denied'
+            session.approval_deny_reason = event.get('deny_reason') or None
             session.approval_event.set()
 
     elif etype == 'inject':
@@ -348,16 +395,24 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._apply_context(session, data)
 
-            tool    = data.get('tool', 'Bash')
-            command = data.get('command', '')
-            display = command[:300].replace('`', "'")
+            tool       = data.get('tool', '')
+            tool_input = data.get('tool_input', {})
+            is_risky   = data.get('is_risky', False)
+
+            # Return immediately if the user already approved this tool type.
+            if tool in session.approve_all:
+                self._send_json(200, {'decision': 'approved'})
+                return
+
+            display = _format_tool_display(tool, tool_input)
+            header  = "⚠️ *High-risk operation*" if is_risky else "🔐 *Permission Request*"
 
             blocks = [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"⚠️ *Approval required* — `{tool}`\n```{display}```",
+                        "text": f"{header} — `{tool}`\n{display}",
                     },
                 },
                 {
@@ -365,14 +420,20 @@ class _Handler(BaseHTTPRequestHandler):
                     "elements": [
                         {
                             "type":      "button",
-                            "text":      {"type": "plain_text", "text": "✅ Approve"},
+                            "text":      {"type": "plain_text", "text": "Yes"},
                             "action_id": "claude_approve",
                             "style":     "primary",
                             "value":     "approve",
                         },
                         {
                             "type":      "button",
-                            "text":      {"type": "plain_text", "text": "❌ Deny"},
+                            "text":      {"type": "plain_text", "text": "Yes to All"},
+                            "action_id": "claude_approve_all",
+                            "value":     tool,   # used by router to scope approve_all
+                        },
+                        {
+                            "type":      "button",
+                            "text":      {"type": "plain_text", "text": "No"},
                             "action_id": "claude_deny",
                             "style":     "danger",
                             "value":     "deny",
@@ -382,21 +443,20 @@ class _Handler(BaseHTTPRequestHandler):
             ]
 
             try:
-                _post_to_thread(session, "Approval required", blocks)
+                _post_to_thread(session, "Permission request", blocks)
             except Exception as e:
                 self._send_json(500, {'error': f'failed to post approval card: {e}'})
                 return
 
             session.approval_event.clear()
-            session.approval_result    = None
+            session.approval_result      = None
+            session.approval_deny_reason = None
             session.waiting_for_approval = True
 
-            deadline = time.monotonic() + APPROVAL_TIMEOUT
-            while time.monotonic() < deadline:
-                remaining = deadline - time.monotonic()
-                if session.approval_event.wait(timeout=min(2.0, remaining)):
+            # Wait indefinitely — only STOP cancels, matching CLI behaviour.
+            while True:
+                if session.approval_event.wait(timeout=2.0):
                     break
-                # Allow stop to interrupt a pending approval wait
                 with session.inbox_lock:
                     if 'STOP' in session.inbox:
                         session.waiting_for_approval = False
@@ -404,13 +464,21 @@ class _Handler(BaseHTTPRequestHandler):
                         return
 
             session.waiting_for_approval = False
-            decision  = session.approval_result or APPROVAL_DEFAULT
-            timed_out = session.approval_result is None
-
-            result: dict = {'decision': decision}
-            if timed_out:
-                result['reason'] = 'timeout'
+            result: dict = {'decision': session.approval_result or 'denied'}
+            if session.approval_deny_reason:
+                result['deny_reason'] = session.approval_deny_reason
             self._send_json(200, result)
+
+        elif path == '/session/start':
+            session = self._session_from_id(data.get('session_id', ''))
+            if not session:
+                return
+            self._apply_context(session, data)
+            try:
+                _get_or_create_thread(session)
+                self._send_json(200, {'ok': True})
+            except Exception as e:
+                self._send_json(500, {'error': str(e)})
 
         elif path == '/thread/reset':
             session = self._session_from_id(data.get('session_id', ''))
